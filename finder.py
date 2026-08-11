@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
 """GCC Product Opportunity Finder -- bestseller / sentiment / price-gap analysis.
 
-Pulls Amazon.sa + Amazon.ae bestseller lists, scores every category on how
-under-served it is, and writes a self-contained HTML report.
+Pulls Amazon.sa, Amazon.ae and Noon.com bestseller data, scores every category on
+how under-served it is, and writes a self-contained HTML report.
 
-  python finder.py                                  # all categories, both markets
+  python finder.py                                  # all categories, all markets
   python finder.py --markets sa --open
-  python finder.py --categories electronics,beauty,health
+  python finder.py --markets noon --categories toys,beauty
   python finder.py --selftest                       # no network, asserts only
 
-Noon.com is not fetched: it sits behind Cloudflare and refuses datacenter/non-GCC
-IPs (ConnectionError/ReadTimeout on every endpoint). See BLOCKED below -- the
-report says so out loud instead of quietly shipping half the market as fact.
+Noon sits behind Akamai and geo-fences non-GCC IPs -- it silently drops the
+connection rather than returning 403. From a GCC IP (or VPN) it is fetched
+directly; from anywhere else it falls back to the r.jina.ai text proxy, which
+reaches Noon's public catalog API. Set JINA_API_KEY to lift 20/min to 200/min.
 """
 from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
 import html
+import json
+import os
 import re
 import statistics as st
 import sys
+import time
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,11 +46,31 @@ CATEGORIES = [
     "baby-products", "pet-supplies", "office-products", "grocery",
     "videogames", "books", "garden", "home-improvement", "health",
 ]
-MARKETS = {"sa": ("Amazon.sa", "SAR"), "ae": ("Amazon.ae", "AED")}
+MARKETS = {"sa": ("Amazon.sa", "SAR"), "ae": ("Amazon.ae", "AED"), "noon": ("Noon.com", "SAR")}
 BLOCKED = {
-    "noon.com": "Cloudflare + geo-fenced; every endpoint times out from outside GCC residential IPs",
     "amazon review text": "full review bodies need per-ASIN pages behind a bot check; star ratings only",
+    "noon direct access": "Akamai geo-fences non-GCC IPs and drops the connection silently; reached "
+                          "via the r.jina.ai text proxy unless you run from the GCC or a VPN",
+    "noon listing counts": "nbHits is Noon's own reported match count for the query, not an audited "
+                           "catalogue census -- treat it as relative, not absolute",
 }
+
+# Noon browses by search query, not by Amazon's slugs. Keys mirror CATEGORIES so
+# both marketplaces land in the same category buckets when scored.
+NOON_CATEGORIES = {
+    "electronics": "electronics", "beauty": "beauty", "home": "home kitchen",
+    "toys": "toys", "automotive": "automotive", "fashion": "fashion",
+    "baby-products": "mom baby", "pet-supplies": "pet supplies",
+    "office-products": "stationery", "grocery": "grocery",
+    "videogames": "video games", "books": "books", "garden": "garden outdoor",
+    "home-improvement": "tools home improvement", "health": "health nutrition",
+}
+NOON_API = ("https://www.noon.com/_svc/catalog/api/v3/search"
+            "?q={q}&limit=100&sort[by]=popularity&sort[dir]=desc")
+JINA = "https://r.jina.ai/"
+# ponytail: keyless jina allows 20 req/60s. Sequential with this gap clears 15
+# categories in ~48s. Knob, not a constant -- the cap moves and a key lifts it.
+NOON_DELAY = 3.2
 
 # ponytail: SAR and AED are both USD-pegged, so this is stable, not a live rate.
 # Knob is here because pegs get re-fixed and the report should not silently lie.
@@ -100,16 +124,85 @@ def parse(page: str, market: str, cat: str) -> list[dict]:
     return out
 
 
-def collect(markets: list[str], cats: list[str], workers: int = 10):
-    jobs = [(m, c) for m in markets for c in cats]
-    products, misses = [], []
-    with cf.ThreadPoolExecutor(workers) as ex:
-        for market, cat, page in ex.map(lambda a: fetch(*a), jobs):
-            got = parse(page, market, cat) if page else []
+def fetch_noon(cat: str) -> dict | None:
+    """Noon catalog API -> raw JSON. Direct first (fast, works from GCC/VPN), then
+    the jina text proxy (works from anywhere Akamai has geo-fenced)."""
+    url = NOON_API.format(q=requests.utils.quote(NOON_CATEGORIES.get(cat, cat)))
+    key = os.environ.get("JINA_API_KEY", "").strip()
+    # The proxy hop must stay minimal: a browser User-Agent trips Cloudflare's
+    # challenge on r.jina.ai, and Accept:application/json makes it return 0 hits.
+    proxy = (JINA + url, {"x-respond-with": "text",
+                          **({"Authorization": f"Bearer {key}"} if key else {})}, 60)
+    # Direct, then the proxy twice -- the proxy occasionally truncates a large
+    # payload mid-string, which is transient and clears on a retry.
+    attempts = [(url, {**HEADERS, "Accept": "application/json"}, 8), proxy, proxy]
+    for target, headers, timeout in attempts:
+        try:
+            r = requests.get(target, headers=headers, timeout=timeout)
+            if r.status_code == 200:
+                return json.loads(r.text)
+        except (requests.RequestException, json.JSONDecodeError):
+            continue
+    return None
+
+
+def parse_noon(payload: dict, cat: str) -> list[dict]:
+    """Noon hits -> the same product dict parse() emits, so scoring needs no changes."""
+    out = []
+    for i, h in enumerate(payload.get("hits") or []):
+        rating = h.get("product_rating") or {}
+        # sale_price is what the customer actually pays; price is the struck-through list.
+        paid = h.get("sale_price") or h.get("price")
+        listed = h.get("price") or paid
+        if not paid:
+            continue
+        out.append({
+            "asin": h.get("sku", ""),
+            "market": "noon",
+            "category": cat,
+            "rank": i + 1,
+            "title": (h.get("name") or "").strip(),
+            "rating": float(rating["value"]) if rating.get("value") else None,
+            "reviews": int(rating.get("count") or 0),
+            "price": float(paid),
+            "currency": "SAR",
+            "price_sar": round(float(paid), 2),
+            "img": h.get("image_url", ""),
+            "url": f"https://www.noon.com/saudi-en/{h.get('url', '')}",
+            "seller": h.get("store_name") or "unknown",
+            "list_price": float(listed),
+            "discount": round(1 - float(paid) / float(listed), 3) if listed and listed > 0 else 0.0,
+            "is_bestseller": bool(h.get("is_bestseller")),
+        })
+    return out
+
+
+def collect(markets: list[str], cats: list[str], workers: int = 10, noon_delay: float = NOON_DELAY):
+    """Amazon pages fetch concurrently; Noon is paced to respect the proxy rate cap."""
+    amz = [m for m in markets if m != "noon"]
+    products, misses, depth = [], [], {}
+
+    jobs = [(m, c) for m in amz for c in cats]
+    if jobs:
+        with cf.ThreadPoolExecutor(workers) as ex:
+            for market, cat, page in ex.map(lambda a: fetch(*a), jobs):
+                got = parse(page, market, cat) if page else []
+                products.extend(got)
+                if not got:
+                    misses.append(f"amazon.{market}/{cat}")
+
+    if "noon" in markets:
+        for n, cat in enumerate(cats):
+            if n:
+                time.sleep(noon_delay)
+            payload = fetch_noon(cat)
+            got = parse_noon(payload, cat) if payload else []
             products.extend(got)
-            if not got:
-                misses.append(f"amazon.{market}/{cat}")
-    return products, misses
+            if got:
+                depth[cat] = {"listings": payload.get("nbHits") or 0, "items": got}
+            else:
+                misses.append(f"noon/{cat}")
+    return products, misses, depth
 
 
 # --------------------------------------------------------------------------- score
@@ -173,6 +266,39 @@ def score(rows: list[dict]) -> list[dict]:
     return sorted(rows, key=lambda r: -r["opportunity"])
 
 
+def noon_depth(depth: dict) -> list[dict]:
+    """Signals only Noon exposes: competition density, discount pressure, seller spread."""
+    rows = []
+    for cat, d in depth.items():
+        items = d["items"]
+        cut = [p["discount"] for p in items if p["discount"] > 0]
+        sellers = {p["seller"] for p in items}
+        rows.append({
+            "category": cat,
+            "listings": d["listings"],
+            "sampled": len(items),
+            "med_discount": round(100 * st.median(cut), 1) if cut else 0.0,
+            "discounted": round(100 * len(cut) / len(items)) if items else 0,
+            "sellers": len(sellers),
+            "seller_spread": round(100 * len(sellers) / len(items)) if items else 0,
+            "bestsellers": sum(1 for p in items if p["is_bestseller"]),
+        })
+    return sorted(rows, key=lambda r: -r["listings"])
+
+
+def per_source(products: list[dict], ranked: list[dict]) -> list[dict]:
+    """Score the Amazon-only and Noon-only pools separately for side-by-side columns.
+    A category missing from a marketplace gets None -- never a fabricated zero."""
+    def sub(pool):
+        return {r["category"]: r["opportunity"] for r in score(category_stats(pool))} if pool else {}
+    amz = sub([p for p in products if p["market"] != "noon"])
+    noon = sub([p for p in products if p["market"] == "noon"])
+    for r in ranked:
+        r["amzn_score"] = amz.get(r["category"])
+        r["noon_score"] = noon.get(r["category"])
+    return ranked
+
+
 def weak_incumbents(products: list[dict], limit: int = 40) -> list[dict]:
     """Bestsellers customers actively dislike: proven demand, poor satisfaction."""
     hits = [p for p in products if p["rating"] and p["rating"] <= 4.2 and p["reviews"] >= 30]
@@ -189,7 +315,7 @@ def arbitrage(products: list[dict], limit: int = 25) -> list[dict]:
         by_asin.setdefault(p["asin"], {})[p["market"]] = p
     out = []
     for asin, mk in by_asin.items():
-        if len(mk) < 2:
+        if "sa" not in mk or "ae" not in mk:   # Noon SKUs share no namespace with ASINs
             continue
         sa, ae = mk["sa"], mk["ae"]
         lo, hi = sorted((sa["price_sar"], ae["price_sar"]))
@@ -238,33 +364,46 @@ code{background:rgba(110,118,129,.18);padding:1px 5px;border-radius:4px;font-siz
   <div class="kpi"><b>$n_products</b><span>products analysed</span></div>
   <div class="kpi"><b>$n_cats</b><span>categories ranked</span></div>
   <div class="kpi"><b>$n_weak</b><span>weak incumbents</span></div>
+  <div class="kpi"><b>$n_listings</b><span>Noon rival listings</span></div>
   <div class="kpi"><b>$n_arb</b><span>SA/AE price gaps</span></div>
   <div class="kpi"><b>$top_cat</b><span>best opportunity</span></div>
 </div>
 
-<h2>1 &middot; Category opportunity ranking</h2>
+<h2>1 &middot; GCC category opportunity ranking</h2>
 <div class="tw"><table>
-<tr><th>#</th><th>Category</th><th class="num">Score</th><th class="num">Median reviews</th>
-<th class="num">Avg rating</th><th class="num">Rated &lt;4.2</th><th class="num">Newcomers</th>
-<th class="num">Price band (SAR)</th><th class="num">Biggest gap</th></tr>
+<tr><th>#</th><th>Category</th><th class="num">GCC score</th><th class="num">Amzn</th><th class="num">Noon</th>
+<th class="num">Median reviews</th><th class="num">Avg rating</th><th class="num">Rated &lt;4.2</th>
+<th class="num">Newcomers</th><th class="num">Price band (SAR)</th><th class="num">Biggest gap</th></tr>
 $cat_rows
 </table></div>
-<div class="note"><b>Score</b> = 35% low review moat (median reviews of the chart &mdash; low means incumbents
-are beatable) + 30% weak sentiment (share of bestsellers rated under 4.2) + 20% price gap (largest empty
-band in the p10&ndash;p90 price body) + 15% newcomer share (chart entries under 100 reviews &mdash; proves a
-new seller can rank). All four are percentiles <i>within this run</i>, so the ranking stays valid as
-Amazon's absolute numbers drift.</div>
+<div class="note"><b>GCC score</b> = 35% low review moat (median reviews of the chart &mdash; low means
+incumbents are beatable) + 30% weak sentiment (share of bestsellers rated under 4.2) + 20% price gap
+(largest empty band in the p10&ndash;p90 price body) + 15% newcomer share (chart entries under 100 reviews
+&mdash; proves a new seller can rank). All four are percentiles <i>within this run</i>, so the ranking stays
+valid as absolute numbers drift. <b>Amzn</b> and <b>Noon</b> re-run the same four signals on that
+marketplace alone; <b>&mdash;</b> means the category did not return data there.</div>
 
-<h2>2 &middot; Weak incumbents &mdash; proven demand, unhappy buyers</h2>
+<h2>2 &middot; Noon competition depth</h2>
+<div class="sub">Signals only Noon exposes. <b>Listings</b> is how many products compete for the query &mdash;
+the most direct read on crowding. <b>Median discount</b> is margin pressure: heavy discounting means
+incumbents are buying their rank. <b>Sellers/100</b> is fragmentation &mdash; a high number means no
+entrenched winner, a low number means one seller owns the category.</div>
+<div class="tw"><table>
+<tr><th>Category</th><th class="num">Listings</th><th class="num">Sampled</th><th class="num">Median discount</th>
+<th class="num">On discount</th><th class="num">Sellers/100</th><th class="num">Flagged bestseller</th></tr>
+$noon_rows
+</table></div>
+
+<h2>3 &middot; Weak incumbents &mdash; proven demand, unhappy buyers</h2>
 <div class="sub">Bestsellers rated 4.2 or below with 30+ ratings. Demand is confirmed by the chart position;
 the rating says the current product does not satisfy it.</div>
 <div class="tw"><table>
-<tr><th>Product</th><th>Category</th><th class="num">Rank</th><th class="num">Rating</th>
+<tr><th>Product</th><th>Market</th><th>Category</th><th class="num">Rank</th><th class="num">Rating</th>
 <th class="num">Ratings</th><th class="num">Price</th></tr>
 $weak_rows
 </table></div>
 
-<h2>3 &middot; Cross-market price gaps (SA vs AE)</h2>
+<h2>4 &middot; Cross-market price gaps (Amazon SA vs AE)</h2>
 <div class="sub">Identical ASIN priced 15%+ apart after SAR/AED peg conversion at $peg.
 Signals thin local competition on the expensive side.</div>
 <div class="tw"><table>
@@ -273,8 +412,8 @@ Signals thin local competition on the expensive side.</div>
 $arb_rows
 </table></div>
 
-<h2>4 &middot; What this does not cover</h2>
-<div class="tw"><table><tr><th>Source</th><th>Why it is missing</th></tr>$blocked_rows</table></div>
+<h2>5 &middot; Caveats and coverage</h2>
+<div class="tw"><table><tr><th>Item</th><th>What to know</th></tr>$blocked_rows</table></div>
 $misses
 <div class="sub" style="margin-top:28px">Bestseller ranks are a 24h snapshot and rotate daily. Re-run before
 acting &mdash; <code>python finder.py</code>. Star ratings stand in for review sentiment; full review text is
@@ -287,23 +426,35 @@ def pill(v: float) -> str:
     return f'<span class="pill {cls}">{v:.0f}</span>'
 
 
-def render(cats, weak, arb, products, misses, out: Path) -> Path:
+def render(cats, noon, weak, arb, products, misses, out: Path) -> Path:
     e = html.escape
+    sub = lambda v: f"{v:.0f}" if v is not None else "&mdash;"  # noqa: E731 -- absent, not zero
     cat_rows = "\n".join(
         f'<tr><td class="num">{i}</td><td class="cat">{e(r["category"].replace("-", " "))}</td>'
         f'<td class="num">{pill(r["opportunity"])}<div class="bar" style="width:{r["opportunity"]:.0f}%"></div></td>'
+        f'<td class="num">{sub(r.get("amzn_score"))}</td><td class="num">{sub(r.get("noon_score"))}</td>'
         f'<td class="num">{r["med_reviews"]:,.0f}</td><td class="num">{r["avg_rating"]}</td>'
         f'<td class="num">{r["weak_share"]*100:.0f}%</td><td class="num">{r["entrant_share"]*100:.0f}%</td>'
         f'<td class="num">{r["price_lo"]:,.0f} &ndash; {r["price_hi"]:,.0f}</td>'
         f'<td class="num">{r["gap_lo"]:,.0f} &rarr; {r["gap_hi"]:,.0f}</td></tr>'
         for i, r in enumerate(cats, 1))
 
+    noon_rows = "\n".join(
+        f'<tr><td class="cat">{e(r["category"].replace("-", " "))}</td>'
+        f'<td class="num">{r["listings"]:,}</td><td class="num">{r["sampled"]}</td>'
+        f'<td class="num">{r["med_discount"]:.0f}%</td><td class="num">{r["discounted"]}%</td>'
+        f'<td class="num">{r["seller_spread"]}</td><td class="num">{r["bestsellers"]}</td></tr>'
+        for r in noon) or \
+        '<tr><td colspan="7">Noon returned no data this run &mdash; add <code>noon</code> to ' \
+        '<code>--markets</code>, or the proxy hop failed (see caveats).</td></tr>'
+
     weak_rows = "\n".join(
         f'<tr><td class="t"><a href="{p["url"]}" target="_blank" rel="noopener">{e(p["title"][:110])}</a></td>'
-        f'<td class="cat">{e(p["category"].replace("-", " "))}</td><td class="num">#{p["rank"]}</td>'
+        f'<td>{MARKETS[p["market"]][0]}</td><td class="cat">{e(p["category"].replace("-", " "))}</td>'
+        f'<td class="num">#{p["rank"]}</td>'
         f'<td class="num">{p["rating"]}</td><td class="num">{p["reviews"]:,}</td>'
         f'<td class="num">{p["currency"]} {p["price"]:,.0f}</td></tr>' for p in weak) or \
-        '<tr><td colspan="6">No bestseller fell below 4.2 with enough ratings.</td></tr>'
+        '<tr><td colspan="7">No bestseller fell below 4.2 with enough ratings.</td></tr>'
 
     arb_rows = "\n".join(
         f'<tr><td class="t"><a href="{r["url"]}" target="_blank" rel="noopener">{e(r["title"][:110])}</a></td>'
@@ -315,12 +466,14 @@ def render(cats, weak, arb, products, misses, out: Path) -> Path:
     miss_html = (f'<div class="note">Returned no parseable grid this run: {e(", ".join(misses))}</div>'
                  if misses else "")
 
+    listings = sum(r["listings"] for r in noon)
     out.write_text(PAGE.substitute(
         n_products=f"{len(products):,}", n_cats=len(cats), n_weak=len(weak), n_arb=len(arb),
+        n_listings=f"{listings:,}" if listings else "&mdash;",
         top_cat=cats[0]["category"].replace("-", " ").title() if cats else "n/a",
-        markets=", ".join(sorted({f"Amazon.{p['market']}" for p in products})) or "none",
+        markets=", ".join(sorted({MARKETS[p["market"]][0] for p in products})) or "none",
         ts=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), peg=f"1 AED = {AED_TO_SAR} SAR",
-        cat_rows=cat_rows, weak_rows=weak_rows, arb_rows=arb_rows,
+        cat_rows=cat_rows, noon_rows=noon_rows, weak_rows=weak_rows, arb_rows=arb_rows,
         blocked_rows=blocked_rows, misses=miss_html), encoding="utf-8")
     return out
 
@@ -366,6 +519,38 @@ def selftest() -> int:
     assert ranked[0]["opportunity"] > ranked[1]["opportunity"]
 
     assert len(weak_incumbents(easy)) == 30 and not weak_incumbents(hard)
+
+    # -- Noon normalisation: nested rating, sale_price wins, discount maths.
+    payload = {"nbHits": 53556, "hits": [
+        {"sku": "N70215854V", "name": "ASUS Vivobook 14", "price": 1529, "sale_price": 1449,
+         "product_rating": {"value": 4.4, "count": 3687, "best_rating": 4.6},
+         "store_name": "noon", "url": "asus-vivobook/p/", "is_bestseller": True},
+        {"sku": "N999", "name": "No discount item", "price": 100, "sale_price": 100,
+         "product_rating": {}, "store_name": "JXH", "url": "x/p/", "is_bestseller": False},
+    ]}
+    n = parse_noon(payload, "electronics")
+    assert len(n) == 2 and n[0]["market"] == "noon" and n[0]["rank"] == 1
+    assert n[0]["rating"] == 4.4 and n[0]["reviews"] == 3687        # off the nested object
+    assert n[0]["price"] == 1449 and n[0]["price_sar"] == 1449.0    # sale_price, not list
+    assert n[0]["discount"] == round(1 - 1449 / 1529, 3) and n[0]["seller"] == "noon"
+    assert n[1]["rating"] is None and n[1]["reviews"] == 0 and n[1]["discount"] == 0.0
+    assert set(n[0]) >= set(got[0]), "Noon dict must be a superset of the Amazon shape"
+
+    d = noon_depth({"electronics": {"listings": 53556, "items": n}})[0]
+    assert d["listings"] == 53556 and d["sellers"] == 2 and d["discounted"] == 50
+    assert d["bestsellers"] == 1
+
+    # Per-source columns: present in both -> two numbers; present in one -> None, not 0.
+    both = easy + [dict(p, category="easy", market="noon") for p in hard]
+    for p in both[:30]:
+        p["market"] = "sa"
+    ranked = per_source(both, score(category_stats(both)))
+    assert ranked[0]["amzn_score"] is not None and ranked[0]["noon_score"] is not None
+    solo = per_source(easy, score(category_stats(easy)))
+    assert solo[0]["noon_score"] is None, "absent marketplace must be None, never 0"
+
+    # Amazon-only ASIN matching must not pair a Noon SKU with an Amazon listing.
+    assert arbitrage(n + [dict(p, market="sa", asin="N70215854V") for p in easy[:1]]) == []
     print("selftest OK")
     return 0
 
@@ -373,8 +558,10 @@ def selftest() -> int:
 # --------------------------------------------------------------------------- cli
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--markets", default="sa,ae", help="comma list of: sa, ae (default both)")
+    p.add_argument("--markets", default="sa,ae,noon", help="comma list of: sa, ae, noon (default all)")
     p.add_argument("--categories", default=",".join(CATEGORIES), help="comma list (default all 15)")
+    p.add_argument("--noon-delay", type=float, default=NOON_DELAY,
+                   help=f"seconds between Noon calls, proxy caps at 20/min (default {NOON_DELAY})")
     p.add_argument("--out", type=Path, default=ROOT / "report.html")
     p.add_argument("--open", action="store_true", help="open the report when done")
     p.add_argument("--selftest", action="store_true", help="run asserts, no network")
@@ -389,21 +576,24 @@ def main(argv=None) -> int:
         print(f"No valid market. Pick from: {', '.join(MARKETS)}", file=sys.stderr)
         return 2
 
-    print(f"Fetching {len(markets) * len(cats)} bestseller pages...")
-    products, misses = collect(markets, cats)
+    print(f"Fetching {len(markets) * len(cats)} listings pages"
+          f"{' (Noon is paced for the proxy rate cap)' if 'noon' in markets else ''}...")
+    products, misses, depth = collect(markets, cats, noon_delay=a.noon_delay)
     if not products:
-        print("Nothing fetched -- Amazon returned no parseable grid. Retry or check connectivity.",
+        print("Nothing fetched -- no marketplace returned parseable data. Retry or check connectivity.",
               file=sys.stderr)
         return 1
 
-    rows = score(category_stats(products))
+    rows = per_source(products, score(category_stats(products)))
+    noon = noon_depth(depth)
     weak = weak_incumbents(products)
-    arb = arbitrage(products) if len(markets) > 1 else []
-    print(f"{len(products)} products -> {len(rows)} categories, {len(weak)} weak incumbents, {len(arb)} price gaps")
+    arb = arbitrage(products) if {"sa", "ae"} <= set(markets) else []
+    print(f"{len(products)} products -> {len(rows)} categories, {len(weak)} weak incumbents, "
+          f"{len(noon)} Noon categories, {len(arb)} price gaps")
     if misses:
-        print(f"No grid from: {', '.join(misses)}")
+        print(f"No data from: {', '.join(misses)}")
 
-    out = render(rows, weak, arb, products, misses, a.out)
+    out = render(rows, noon, weak, arb, products, misses, a.out)
     print(f"Report: {out.resolve()}")
     for r in rows[:5]:
         print(f"  {r['opportunity']:5.1f}  {r['category']}")
